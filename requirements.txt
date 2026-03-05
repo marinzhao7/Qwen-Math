@@ -1,0 +1,21 @@
+# 基础依赖
+numpy
+pandas
+scikit-learn
+matplotlib
+
+# 深度学习框架
+torch
+transformers
+
+# 数据处理
+datasets
+
+# 训练框架
+ms-swift
+
+# 评估框架
+opencompass
+
+# 工具
+tqdm
