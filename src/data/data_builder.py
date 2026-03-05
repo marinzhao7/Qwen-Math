@@ -42,7 +42,7 @@ class DataBuilder:
                         continue
         
         # 根据难度平均采样，确保各难度等级的分布均匀
-        sampled_data = self._sample_by_difficulty(data, sample_size=300)
+        sampled_data = self._sample_by_difficulty(data, sample_size=3000)
         return sampled_data
     
     def _count_gsm8k_steps(self, answer: str) -> int:

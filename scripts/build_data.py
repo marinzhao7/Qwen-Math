@@ -45,13 +45,12 @@ def main():
     if not os.path.exists(math_path):
         # 使用datasets库下载MATH-500数据集
         ds = load_dataset("HuggingFaceH4/MATH-500")
-        print(ds)
         # 确保目录存在
         os.makedirs(os.path.dirname(math_path), exist_ok=True)
         
         # 保存为JSONL格式
         with open(math_path, 'w', encoding='utf-8') as f:
-            for item in ds:
+            for item in ds['test']:
                 json.dump(item, f, ensure_ascii=False)
                 f.write('\n')
         print(f"MATH500 dataset saved to {math_path}")
