@@ -9,6 +9,7 @@ class BaseConfig:
     data_dir = "data"
     gsm8k_train_path = "data/gsm8k/train.jsonl"
     math_train_path = "data/math/train.jsonl"
+    use_filtered_data = False  # 是否使用质量过滤后的数据
     
     # 训练配置
     batch_size = 8

@@ -1,4 +1,5 @@
 import json
+from logging import config
 import os
 from typing import List, Dict, Any
 
@@ -8,7 +9,7 @@ class DataBuilder:
         self.data_dir = config.data_dir
         
     def load_gsm8k(self, file_path: str) -> List[Dict[str, Any]]:
-        """加载GSM8K数据集"""
+        """加载GSM8K数据集，根据解题步骤数进行难度分级，并根据难度平均采样"""
         data = []
         if os.path.exists(file_path):
             with open(file_path, 'r', encoding='utf-8') as f:
@@ -18,9 +19,19 @@ class DataBuilder:
                         continue
                     try:
                         item = json.loads(line)
+                        answer = item.get('answer', '')
+                        
+                        # 计算解题步骤数
+                        steps = self._count_gsm8k_steps(answer)
+                        
+                        # 根据步骤数确定难度等级
+                        difficulty = self._classify_gsm8k_difficulty(steps)
+                        
                         data.append({
                             'question': item.get('question', ''),
-                            'answer': item.get('answer', ''),
+                            'answer': answer,
+                            'steps': steps,
+                            'difficulty': difficulty,
                             'source': 'gsm8k'
                         })
                     except json.JSONDecodeError as e:
@@ -29,7 +40,37 @@ class DataBuilder:
                     except KeyError as e:
                         print(f"Warning: Missing key {e} in line {line_num} of {file_path}")
                         continue
-        return data
+        
+        # 根据难度平均采样，确保各难度等级的分布均匀
+        sampled_data = self._sample_by_difficulty(data, sample_size=300)
+        return sampled_data
+    
+    def _count_gsm8k_steps(self, answer: str) -> int:
+        """计算GSM8K题目的解题步骤数"""
+        if not answer:
+            return 1
+        
+        # 方法1：计算 <<...>> 计算标记的数量
+        import re
+        calculation_steps = len(re.findall(r'<<.*?>>', answer))
+        
+        # 方法2：计算换行符数量（每个换行通常代表一个步骤）
+        newline_steps = answer.count('\n')
+        
+        # 取两种方法的最大值，确保步骤数准确
+        steps = max(calculation_steps, newline_steps)
+        
+        # 确保至少有1步
+        return max(steps, 1)
+    
+    def _classify_gsm8k_difficulty(self, steps: int) -> str:
+        """根据步骤数分类GSM8K题目难度"""
+        if steps <= 3:
+            return 'easy'
+        elif steps <= 5:
+            return 'medium'
+        else:
+            return 'hard'
     
     def load_math(self, file_path: str) -> List[Dict[str, Any]]:
         """加载MATH500数据集，根据level和subject平均采样"""
@@ -59,20 +100,28 @@ class DataBuilder:
                         continue
         
         # 根据level和subject平均采样，确保各层级和主题的分布均匀
-        sampled_data = self._sample_by_level_and_subject(data, sample_size=500)
-        return sampled_data
+        sampled_data = self._sample_by_level_and_subject(data, sample_size=300)
+        return sampled_data    
+    
+    def _sample_by_difficulty(self, data: List[Dict[str, Any]], sample_size: int) -> List[Dict[str, Any]]:
+        """根据难度平均采样GSM8K数据"""
+        return self._sample_by_key(data, sample_size, key_func=lambda x: x.get('difficulty', 'unknown'))
     
     def _sample_by_level_and_subject(self, data: List[Dict[str, Any]], sample_size: int) -> List[Dict[str, Any]]:
         """根据level和subject平均采样数据"""
+        return self._sample_by_key(data, sample_size, key_func=lambda x: (x.get('level', 'unknown'), x.get('subject', 'unknown')))
+    
+    def _sample_by_key(self, data: List[Dict[str, Any]], sample_size: int, key_func) -> List[Dict[str, Any]]:
+        """根据指定的键函数进行分组采样"""
         import random
         
         if not data:
             return []
         
-        # 按level和subject分组
+        # 按指定的键分组
         groups = {}
         for item in data:
-            key = (item.get('level', 'unknown'), item.get('subject', 'unknown'))
+            key = key_func(item)
             if key not in groups:
                 groups[key] = []
             groups[key].append(item)
@@ -86,7 +135,7 @@ class DataBuilder:
         
         # 采样
         sampled_data = []
-        for group, items in groups.items():
+        for key, items in groups.items():
             sample_count = samples_per_group + (1 if remaining_samples > 0 else 0)
             remaining_samples -= 1
             
@@ -106,13 +155,10 @@ class DataBuilder:
         filtered_data = []
         for item in data:
             # 检查问题长度
-            if len(item['question']) < 50 or len(item['question']) > 1000:
+            if len(item['question']) < 30 or len(item['question']) > 1000:
                 continue
             # 检查答案长度
-            if len(item['answer']) < 100 or len(item['answer']) > 3000:
-                continue
-            # 确保答案包含详细步骤
-            if 'step' not in item.get('answer', '').lower() and '解析' not in item.get('answer', '').lower():
+            if len(item['answer']) < 50 or len(item['answer']) > 2000:
                 continue
             filtered_data.append(item)
         return filtered_data
@@ -132,7 +178,7 @@ class DataBuilder:
             processed_data.append({
                 'question': question,
                 'answer': answer,
-                'source': item.get('source', 'custom')
+                'source': item.get('source', 'others')
             })
         return processed_data
     
@@ -162,13 +208,12 @@ class DataBuilder:
         math_data = self.load_math(self.config.math_train_path)
         
         # 分别处理GSM8K和MATH数据
-        # 筛选高质量数据
-        filtered_gsm8k = self.filter_quality_data(gsm8k_data)
-        filtered_math = self.filter_quality_data(math_data)
-        
-        # 预处理数据
-        processed_gsm8k = self.preprocess_data(filtered_gsm8k)
-        processed_math = self.preprocess_data(filtered_math)
+        if self.config.use_filtered_data:
+            processed_gsm8k = self.filter_quality_data(gsm8k_data)
+            processed_math = self.filter_quality_data(math_data)
+        else:
+            processed_gsm8k = self.preprocess_data(gsm8k_data)
+            processed_math = self.preprocess_data(math_data)
         
         # 划分数据集
         gsm8k_split = self.split_data(processed_gsm8k)
