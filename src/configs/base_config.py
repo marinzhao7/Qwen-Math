@@ -2,7 +2,7 @@
 
 class BaseConfig:
     # 模型配置
-    model_name = "Qwen/Qwen-3B-Thinking"
+    model_name = "Qwen/Qwen3.5-4B-Base"
     max_length = 8192  # 8K推理长度约束
     
     # 数据配置

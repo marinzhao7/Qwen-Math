@@ -8,7 +8,7 @@ from typing import List, Dict, Any, Tuple
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.utils.data import DataLoader, Dataset
 from torch.nn.parallel import DistributedDataParallel as DDP
-from ms_swift import Swift, LoraConfig, SwiftModel
+from swift import Swift, LoraConfig, SwiftModel
 
 class GRPOTrainer:
     def __init__(self, config):

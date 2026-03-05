@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from ms_swift import Swift, LoraConfig, SwiftModel
+from swift import Swift, LoraConfig, SwiftModel
 
 class SFTTrainer:
     def __init__(self, config):
