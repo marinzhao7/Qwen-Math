@@ -1,5 +1,8 @@
 import os
 import json
+import time
+import matplotlib.pyplot as plt
+import numpy as np
 from typing import List, Dict, Any
 
 import torch
@@ -18,6 +21,19 @@ class SFTTrainer:
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
         
+        # 初始化日志文件
+        self.log_file = os.path.join(self.log_dir, f"sft_training_{int(time.time())}.log")
+        
+        # 初始化数据收集
+        self.train_metrics = {
+            'steps': [],
+            'loss': []
+        }
+        self.val_metrics = {
+            'steps': [],
+            'loss': []
+        }
+        
         # 设置GPU
         self._setup_gpu()
         
@@ -30,16 +46,19 @@ class SFTTrainer:
         self.model = self._load_model()
         
         # 配置LoRA
-        self.lora_config = LoraConfig(
-            r=config.lora_rank,
-            lora_alpha=config.lora_alpha,
-            target_modules=config.lora_target_modules,
-            lora_dropout=config.lora_dropout,
-            bias="none"
-        )
-        
-        # 应用LoRA
-        self.model = SwiftModel(self.model, self.lora_config)
+        if config.sft_use_lora:
+            self.lora_config = LoraConfig(
+                r=config.lora_rank,
+                lora_alpha=config.lora_alpha,
+                target_modules=config.lora_target_modules,
+                lora_dropout=config.lora_dropout,
+                bias="none"
+            )
+            
+            # 应用LoRA
+            self.model = SwiftModel(self.model, self.lora_config)
+        else:
+            print("LoRA not enabled, using full parameter training")
         
         # 设置多GPU训练
         self._setup_distributed_training()
@@ -95,6 +114,8 @@ class SFTTrainer:
                 self.world_size = torch.cuda.device_count()
                 os.environ['MASTER_ADDR'] = 'localhost'
                 os.environ['MASTER_PORT'] = '12355'
+                os.environ['RANK'] = str(self.local_rank)
+                os.environ['WORLD_SIZE'] = str(self.world_size)
             
             if not dist.is_initialized():
                 dist.init_process_group(backend='nccl', init_method='env://')
@@ -201,12 +222,24 @@ class SFTTrainer:
                 return self.data[idx]
         
         dataset = MathDataset(data)
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=self.tokenize_batch
-        )
+        
+        # 在分布式训练中使用DistributedSampler
+        if self.is_distributed:
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(dataset, shuffle=shuffle)
+            return DataLoader(
+                dataset,
+                batch_size=batch_size,
+                sampler=sampler,
+                collate_fn=self.tokenize_batch
+            )
+        else:
+            return DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                collate_fn=self.tokenize_batch
+            )
     
     def train(self):
         """执行SFT训练"""
@@ -237,7 +270,8 @@ class SFTTrainer:
         best_val_loss = float('inf')
         
         for epoch in range(self.config.sft_epochs):
-            print(f"Epoch {epoch + 1}/{self.config.sft_epochs}")
+
+            self._log(f"Epoch {epoch + 1}/{self.config.sft_epochs}")
             
             # 训练阶段
             self.model.train()
@@ -260,36 +294,72 @@ class SFTTrainer:
                 total_loss += loss.item()
                 global_step += 1
                 
-                # 日志
-                if global_step % self.config.sft_log_steps == 0:
+                # 日志 - 只在主进程输出
+                if global_step % self.config.sft_log_steps == 0 and (not self.is_distributed or self.local_rank == 0):
                     avg_loss = total_loss / self.config.sft_log_steps
-                    print(f"Step {global_step}, Loss: {avg_loss:.4f}")
+                    self._log(f"Step {global_step}, Loss: {avg_loss:.4f}")
+                    # 记录训练指标
+                    self.train_metrics['steps'].append(global_step)
+                    self.train_metrics['loss'].append(avg_loss)
                     total_loss = 0
                 
-                # 保存模型
-                if global_step % self.config.sft_save_steps == 0:
+                # 保存模型 - 只在主进程执行
+                if global_step % self.config.sft_save_steps == 0 and (not self.is_distributed or self.local_rank == 0):
                     save_path = os.path.join(self.output_dir, f"checkpoint_{global_step}")
-                    self.model.save_pretrained(save_path)
+                    # 获取底层模型（处理DDP包装的情况）
+                    model_to_save = self.model.module if self.is_distributed else self.model
+                    model_to_save.save_pretrained(save_path)
                     self.tokenizer.save_pretrained(save_path)
-                    print(f"Model saved to {save_path}")
+                    self._log(f"Model saved to {save_path}")
                 
-                # 评估
-                if global_step % self.config.sft_eval_steps == 0:
+                # 评估 - 只在主进程执行
+                if global_step % self.config.sft_eval_steps == 0 and (not self.is_distributed or self.local_rank == 0):
                     val_loss = self.evaluate(val_loader)
-                    print(f"Validation Loss: {val_loss:.4f}")
+                    self._log(f"Validation Loss: {val_loss:.4f}")
+                    # 记录验证指标
+                    self.val_metrics['steps'].append(global_step)
+                    self.val_metrics['loss'].append(val_loss)
                     
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         best_save_path = os.path.join(self.output_dir, "best_model")
-                        self.model.save_pretrained(best_save_path)
+                        # 获取底层模型（处理DDP包装的情况）
+                        model_to_save = self.model.module if self.is_distributed else self.model
+                        model_to_save.save_pretrained(best_save_path)
                         self.tokenizer.save_pretrained(best_save_path)
-                        print(f"Best model saved to {best_save_path}")
+                        self._log(f"Best model saved to {best_save_path}")
         
-        # 保存最终模型
-        final_save_path = os.path.join(self.output_dir, "final_model")
-        self.model.save_pretrained(final_save_path)
-        self.tokenizer.save_pretrained(final_save_path)
-        print(f"Final model saved to {final_save_path}")
+        # 保存最终模型 - 只在主进程执行
+        if not self.is_distributed or self.local_rank == 0:
+            final_save_path = os.path.join(self.output_dir, "final_model")
+            # 获取底层模型（处理DDP包装的情况）
+            model_to_save = self.model.module if self.is_distributed else self.model
+            model_to_save.save_pretrained(final_save_path)
+            self.tokenizer.save_pretrained(final_save_path)
+            self._log(f"Final model saved to {final_save_path}")
+            
+            # 生成并保存训练指标图表
+            self._generate_plots()
+    
+    def _generate_plots(self):
+        """生成训练指标图表"""
+        # 创建图表保存目录
+        plots_dir = os.path.join(self.log_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        
+        # 生成损失图表
+        plt.figure(figsize=(12, 8))
+        plt.plot(self.train_metrics['steps'], self.train_metrics['loss'], label='Training Loss')
+        plt.plot(self.val_metrics['steps'], self.val_metrics['loss'], label='Validation Loss', linestyle='--')
+        plt.xlabel('Steps')
+        plt.ylabel('Loss')
+        plt.title('SFT Training Loss')
+        plt.legend()
+        plt.grid(True)
+        loss_plot_path = os.path.join(plots_dir, 'loss_plot.png')
+        plt.savefig(loss_plot_path)
+        plt.close()
+        self._log(f"Loss plot saved to {loss_plot_path}")
     
     def evaluate(self, data_loader):
         """评估模型"""
@@ -304,3 +374,9 @@ class SFTTrainer:
         
         avg_loss = total_loss / len(data_loader)
         return avg_loss
+    
+    def _log(self, message):
+        """记录日志到文件和控制台"""
+        print(message)
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")

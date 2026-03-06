@@ -1,6 +1,9 @@
 import os
 import json
+import time
 import torch
+import matplotlib.pyplot as plt
+import numpy as np
 import torch.nn.functional as F
 import torch.distributed as dist
 from typing import List, Dict, Any, Tuple
@@ -19,6 +22,23 @@ class GRPOTrainer:
         # 创建输出目录
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(self.log_dir, exist_ok=True)
+        
+        # 初始化日志文件
+        self.log_file = os.path.join(self.log_dir, f"grpo_training_{int(time.time())}.log")
+        
+        # 初始化数据收集
+        self.train_metrics = {
+            'steps': [],
+            'loss': [],
+            'policy_loss': [],
+            'kl_div': [],
+            'mean_reward': [],
+            'std_reward': []
+        }
+        self.val_metrics = {
+            'steps': [],
+            'loss': []
+        }
         
         # 设置GPU
         self._setup_gpu()
@@ -42,7 +62,9 @@ class GRPOTrainer:
             )
             
             # 应用LoRA到策略模型
-            self.model = SwiftModel(self.model, self.lora_config)   
+            self.model = SwiftModel(self.model, self.lora_config)
+        else:
+            print("LoRA not enabled, using full parameter training")   
         
         # 加载参考模型（冻结，用于 KL 散度）
         self.reference_model = self._load_reference_model()
@@ -125,6 +147,8 @@ class GRPOTrainer:
                 self.world_size = torch.cuda.device_count()
                 os.environ['MASTER_ADDR'] = 'localhost'
                 os.environ['MASTER_PORT'] = '12356'
+                os.environ['RANK'] = str(self.local_rank)
+                os.environ['WORLD_SIZE'] = str(self.world_size)
             
             if not dist.is_initialized():
                 dist.init_process_group(backend='nccl', init_method='env://')
@@ -136,6 +160,14 @@ class GRPOTrainer:
             # 包装策略模型为DDP
             self.model = DDP(
                 self.model,
+                device_ids=[self.local_rank],
+                output_device=self.local_rank,
+                find_unused_parameters=self.config.grpo_ddp_find_unused_parameters
+            )
+            
+            # 包装参考模型为DDP
+            self.reference_model = DDP(
+                self.reference_model,
                 device_ids=[self.local_rank],
                 output_device=self.local_rank,
                 find_unused_parameters=self.config.grpo_ddp_find_unused_parameters
@@ -239,9 +271,11 @@ class GRPOTrainer:
         generated_ids = outputs.sequences  # [batch_size*G, prompt_len + gen_len]
         
         # 计算生成过程中每个 token 的 log probability
+        # 构建完整的 attention mask 覆盖整个生成序列
+        gen_attention_mask = (generated_ids != self.tokenizer.pad_token_id).long()
         old_log_probs = self._compute_log_probs(
             generated_ids, 
-            attention_mask_expanded,
+            gen_attention_mask,
             prompt_len=input_ids.shape[1]
         )
         
@@ -472,13 +506,26 @@ class GRPOTrainer:
                 return self.data[idx]
         
         dataset = MathDataset(data)
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            collate_fn=self.tokenize_batch,
-            num_workers=0
-        )
+        
+        # 在分布式训练中使用DistributedSampler
+        if self.is_distributed:
+            from torch.utils.data.distributed import DistributedSampler
+            sampler = DistributedSampler(dataset, shuffle=shuffle)
+            return DataLoader(
+                dataset,
+                batch_size=batch_size,
+                sampler=sampler,
+                collate_fn=self.tokenize_batch,
+                num_workers=0
+            )
+        else:
+            return DataLoader(
+                dataset,
+                batch_size=batch_size,
+                shuffle=shuffle,
+                collate_fn=self.tokenize_batch,
+                num_workers=0
+            )
     
     def train(self):
         """执行GRPO训练"""
@@ -509,7 +556,7 @@ class GRPOTrainer:
         best_val_loss = float('inf')
         
         for epoch in range(self.config.grpo_epochs):
-            print(f"\nEpoch {epoch + 1}/{self.config.grpo_epochs}")
+            self._log(f"\nEpoch {epoch + 1}/{self.config.grpo_epochs}")
             
             # 训练阶段
             self.model.train()
@@ -533,39 +580,113 @@ class GRPOTrainer:
                 total_loss += loss.item()
                 global_step += 1
                 
-                # 日志
-                if global_step % self.config.grpo_log_steps == 0:
-                    print(f"Step {global_step} | "
+                # 日志 - 只在主进程输出
+                if global_step % self.config.grpo_log_steps == 0 and (not self.is_distributed or self.local_rank == 0):
+                    self._log(f"Step {global_step} | "
                           f"Loss: {metrics['loss']:.4f} | "
                           f"Policy: {metrics['policy_loss']:.4f} | "
                           f"KL: {metrics['kl_div']:.4f} | "
                           f"Reward: {metrics['mean_reward']:.3f}±{metrics['std_reward']:.3f}")
+                    # 记录训练指标
+                    self.train_metrics['steps'].append(global_step)
+                    self.train_metrics['loss'].append(metrics['loss'])
+                    self.train_metrics['policy_loss'].append(metrics['policy_loss'])
+                    self.train_metrics['kl_div'].append(metrics['kl_div'])
+                    self.train_metrics['mean_reward'].append(metrics['mean_reward'])
+                    self.train_metrics['std_reward'].append(metrics['std_reward'])
                     total_loss = 0
                 
-                # 保存模型
-                if global_step % self.config.grpo_save_steps == 0:
+                # 保存模型 - 只在主进程执行
+                if global_step % self.config.grpo_save_steps == 0 and (not self.is_distributed or self.local_rank == 0):
                     save_path = os.path.join(self.output_dir, f"checkpoint_{global_step}")
-                    self.model.save_pretrained(save_path)
+                    # 获取底层模型（处理DDP包装的情况）
+                    model_to_save = self.model.module if self.is_distributed else self.model
+                    model_to_save.save_pretrained(save_path)
                     self.tokenizer.save_pretrained(save_path)
-                    print(f"Model saved to {save_path}")
+                    self._log(f"Model saved to {save_path}")
                 
-                # 评估
-                if global_step % self.config.grpo_eval_steps == 0:
+                # 评估 - 只在主进程执行
+                if global_step % self.config.grpo_eval_steps == 0 and (not self.is_distributed or self.local_rank == 0):
                     val_loss = self.evaluate(val_loader)
-                    print(f"Validation Loss: {val_loss:.4f}")
+                    self._log(f"Validation Loss: {val_loss:.4f}")
+                    # 记录验证指标
+                    self.val_metrics['steps'].append(global_step)
+                    self.val_metrics['loss'].append(val_loss)
                     
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         best_save_path = os.path.join(self.output_dir, "best_model")
-                        self.model.save_pretrained(best_save_path)
+                        # 获取底层模型（处理DDP包装的情况）
+                        model_to_save = self.model.module if self.is_distributed else self.model
+                        model_to_save.save_pretrained(best_save_path)
                         self.tokenizer.save_pretrained(best_save_path)
-                        print(f"Best model saved to {best_save_path}")
+                        self._log(f"Best model saved to {best_save_path}")
         
-        # 保存最终模型
-        final_save_path = os.path.join(self.output_dir, "final_model")
-        self.model.save_pretrained(final_save_path)
-        self.tokenizer.save_pretrained(final_save_path)
-        print(f"Final model saved to {final_save_path}")
+        # 保存最终模型 - 只在主进程执行
+        if not self.is_distributed or self.local_rank == 0:
+            final_save_path = os.path.join(self.output_dir, "final_model")
+            # 获取底层模型（处理DDP包装的情况）
+            model_to_save = self.model.module if self.is_distributed else self.model
+            model_to_save.save_pretrained(final_save_path)
+            self.tokenizer.save_pretrained(final_save_path)
+            self._log(f"Final model saved to {final_save_path}")
+            
+            # 生成并保存训练指标图表
+            self._generate_plots()
+    
+    def _generate_plots(self):
+        """生成训练指标图表"""
+        # 创建图表保存目录
+        plots_dir = os.path.join(self.log_dir, "plots")
+        os.makedirs(plots_dir, exist_ok=True)
+        
+        # 生成损失和策略损失图表
+        plt.figure(figsize=(12, 8))
+        plt.plot(self.train_metrics['steps'], self.train_metrics['loss'], label='Total Loss')
+        plt.plot(self.train_metrics['steps'], self.train_metrics['policy_loss'], label='Policy Loss')
+        plt.plot(self.val_metrics['steps'], self.val_metrics['loss'], label='Validation Loss', linestyle='--')
+        plt.xlabel('Steps')
+        plt.ylabel('Loss')
+        plt.title('GRPO Training Loss')
+        plt.legend()
+        plt.grid(True)
+        loss_plot_path = os.path.join(plots_dir, 'loss_plot.png')
+        plt.savefig(loss_plot_path)
+        plt.close()
+        self._log(f"Loss plot saved to {loss_plot_path}")
+        
+        # 生成KL散度图表
+        plt.figure(figsize=(12, 8))
+        plt.plot(self.train_metrics['steps'], self.train_metrics['kl_div'], label='KL Divergence')
+        plt.xlabel('Steps')
+        plt.ylabel('KL Divergence')
+        plt.title('GRPO KL Divergence')
+        plt.legend()
+        plt.grid(True)
+        kl_plot_path = os.path.join(plots_dir, 'kl_div_plot.png')
+        plt.savefig(kl_plot_path)
+        plt.close()
+        self._log(f"KL divergence plot saved to {kl_plot_path}")
+        
+        # 生成奖励图表
+        plt.figure(figsize=(12, 8))
+        plt.plot(self.train_metrics['steps'], self.train_metrics['mean_reward'], label='Mean Reward')
+        plt.fill_between(
+            self.train_metrics['steps'],
+            np.array(self.train_metrics['mean_reward']) - np.array(self.train_metrics['std_reward']),
+            np.array(self.train_metrics['mean_reward']) + np.array(self.train_metrics['std_reward']),
+            alpha=0.2,
+            label='Reward Std Dev'
+        )
+        plt.xlabel('Steps')
+        plt.ylabel('Reward')
+        plt.title('GRPO Reward')
+        plt.legend()
+        plt.grid(True)
+        reward_plot_path = os.path.join(plots_dir, 'reward_plot.png')
+        plt.savefig(reward_plot_path)
+        plt.close()
+        self._log(f"Reward plot saved to {reward_plot_path}")
     
     def evaluate(self, data_loader):
         """评估模型"""
@@ -581,3 +702,9 @@ class GRPOTrainer:
         
         avg_loss = total_loss / len(data_loader)
         return avg_loss
+    
+    def _log(self, message):
+        """记录日志到文件和控制台"""
+        print(message)
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")

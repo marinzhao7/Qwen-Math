@@ -13,6 +13,7 @@ class SFTConfig(BaseConfig):
     sft_weight_decay = 0.01
     
     # LoRA配置
+    sft_use_lora = True
     lora_rank = 8
     lora_alpha = 16
     lora_dropout = 0.1
