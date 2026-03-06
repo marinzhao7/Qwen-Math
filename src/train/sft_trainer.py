@@ -48,7 +48,7 @@ class SFTTrainer:
         """设置GPU环境"""
         if self.config.sft_gpu_ids is not None:
             # 指定GPU
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.config.sft_gpu_ids))
+            torch.cuda.set_device(self.config.sft_gpu_ids[0])
             print(f"Using specified GPUs: {self.config.sft_gpu_ids}")
         
         if not torch.cuda.is_available():
@@ -113,7 +113,7 @@ class SFTTrainer:
             
             self.is_distributed = True
             print(f"Distributed training initialized: rank {self.local_rank}/{self.world_size}")
-        elif torch.cuda.device_count() == 1:
+        elif len(self.config.sft_gpu_ids) == 1:
             print("Single GPU training")
         else:
             print("CPU training")

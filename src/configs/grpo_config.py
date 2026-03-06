@@ -46,8 +46,8 @@ class GRPOConfig(BaseConfig):
     # 其他配置
     grpo_use_lora = True
     grpo_use_gradient_checkpointing = True
-    grpo_use_fp16 = True
-    grpo_use_bf16 = False
+    grpo_use_fp16 = False
+    grpo_use_bf16 = True
     
     # 多GPU训练配置
     grpo_use_multi_gpu = False  # 是否使用多GPU训练
