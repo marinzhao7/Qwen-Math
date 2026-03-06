@@ -32,8 +32,3 @@ class BaseConfig:
     # GRPO配置
     grpo_beta = 0.1
     grpo_tau = 0.95
-    
-    # GPU配置
-    gpu_ids = None  # None表示使用所有可用GPU，或指定列表如[0, 1, 2, 3]
-    use_multi_gpu = False  # 是否使用多GPU训练
-    local_rank = -1  # 分布式训练本地rank

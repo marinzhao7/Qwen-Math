@@ -51,5 +51,5 @@ class GRPOConfig(BaseConfig):
     
     # 多GPU训练配置
     grpo_use_multi_gpu = False  # 是否使用多GPU训练
-    grpo_gpu_ids = None  # None表示使用所有可用GPU，或指定列表如[0, 1]
+    grpo_gpu_ids = [0]  # None表示使用所有可用GPU，或指定列表如[0, 1]
     grpo_ddp_find_unused_parameters = False  # DDP是否查找未使用参数

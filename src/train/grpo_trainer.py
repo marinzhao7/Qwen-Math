@@ -191,6 +191,7 @@ class GRPOTrainer:
         tokenized = self.tokenizer(
             prompts,
             padding=True,
+            padding_side='left',
             truncation=True,
             max_length=self.config.grpo_max_prompt_length,
             return_tensors="pt"
