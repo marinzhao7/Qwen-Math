@@ -70,14 +70,13 @@ class SFTTrainer:
             model = model.to(self.device)
             print(f"Model loaded on {torch.cuda.device_count()} GPUs")
         else:
-            # 单GPU或CPU，使用device_map自动分配
+            # 单GPU训练，显式指定GPU设备
             model = AutoModelForCausalLM.from_pretrained(
                 self.config.sft_model_name,
                 torch_dtype=torch.float16 if self.config.sft_use_fp16 else torch.bfloat16 if self.config.sft_use_bf16 else torch.float32,
-                device_map="auto" if not self.config.sft_use_multi_gpu else None
             )
-            if not self.config.sft_use_multi_gpu:
-                print("Model loaded with device_map='auto'")
+            model = model.to(self.device)
+            print(f"Model loaded on GPU: {self.device}")
         
         return model
     

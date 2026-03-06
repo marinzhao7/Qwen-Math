@@ -67,10 +67,10 @@ class GRPOTrainerSwift:
         model = AutoModelForCausalLM.from_pretrained(
             self.config.grpo_model_name,
             torch_dtype=torch.bfloat16 if self.config.grpo_use_bf16 else torch.float16,
-            device_map="auto",
             trust_remote_code=True
         )
-        print(f"Model loaded: {self.config.grpo_model_name}")
+        model = model.to(self.device)
+        print(f"Model loaded on GPU: {self.device}")
         return model
     
     def _reward_function(self, generated_texts: List[str], reference_answers: List[str]) -> List[float]:
