@@ -29,7 +29,7 @@ class SFTConfig(BaseConfig):
     sft_log_steps = 10
     
     # 模型配置
-    sft_model_name = "Qwen/Qwen3-4B-Base"
+    sft_model_name = "Qwen/Qwen3.5-2B-Base"
     sft_max_length = 8192
     
     # 其他配置
