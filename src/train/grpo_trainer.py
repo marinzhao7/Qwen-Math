@@ -13,6 +13,11 @@ from torch.utils.data import DataLoader, Dataset
 from torch.nn.parallel import DistributedDataParallel as DDP
 from swift import Swift, LoraConfig, SwiftModel
 
+from .trainer_utils import (
+    setup_gpu, load_model, setup_distributed_training, 
+    apply_lora, create_data_loader, get_model_to_save, log_message, load_data
+)
+
 class GRPOTrainer:
     def __init__(self, config):
         self.config = config
@@ -41,7 +46,7 @@ class GRPOTrainer:
         }
         
         # 设置GPU
-        self._setup_gpu()
+        self.device = setup_gpu(self.config.grpo_gpu_ids)
         
         # 加载分词器
         self.tokenizer = AutoTokenizer.from_pretrained(config.grpo_model_name)
@@ -49,114 +54,40 @@ class GRPOTrainer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
         # 加载策略模型（当前模型）
-        self.model = self._load_model()
+        self.model = load_model(
+            self.config.grpo_model_name,
+            self.config.grpo_use_multi_gpu,
+            self.device,
+            self.config.grpo_use_fp16,
+            self.config.grpo_use_bf16
+        )
+        print(f"Policy model loaded")
         
         # 配置LoRA
-        if config.grpo_use_lora:
-            self.lora_config = LoraConfig(
-                r=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                target_modules=config.lora_target_modules,
-                lora_dropout=config.lora_dropout,
-                bias="none"
-            )
-            
-            # 应用LoRA到策略模型
-            self.model = SwiftModel(self.model, self.lora_config)
-        else:
-            print("LoRA not enabled, using full parameter training")   
+        self.model = apply_lora(self.model, self.config, self.config.grpo_use_lora)   
         
         # 加载参考模型（冻结，用于 KL 散度）
-        self.reference_model = self._load_reference_model()
+        self.reference_model = load_model(
+            self.config.grpo_model_name,
+            self.config.grpo_use_multi_gpu,
+            self.device,
+            self.config.grpo_use_fp16,
+            self.config.grpo_use_bf16
+        )
+        print(f"Reference model loaded")
+        
+        for param in self.reference_model.parameters():
+            param.requires_grad = False
+        self.reference_model.eval()
         
         # 设置多GPU训练
-        self._setup_distributed_training()
-    
-    def _setup_gpu(self):
-        """设置GPU环境"""
-        if self.config.grpo_gpu_ids is not None:
-            # 指定GPU
-            torch.cuda.set_device(self.config.grpo_gpu_ids[0])
-            print(f"Using specified GPUs: {self.config.grpo_gpu_ids}")
+        self.is_distributed, self.local_rank, self.world_size = setup_distributed_training(
+            self.config.grpo_use_multi_gpu,
+            self.config.grpo_gpu_ids,
+            self.config.grpo_ddp_find_unused_parameters
+        )
         
-        if not torch.cuda.is_available():
-            print("CUDA not available, using CPU")
-            self.device = torch.device("cpu")
-        else:
-            self.device = torch.device("cuda")
-            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    
-    def _load_model(self):
-        """加载策略模型"""
-        if self.config.grpo_use_multi_gpu and torch.cuda.device_count() > 1:
-            # 多GPU训练，不使用device_map
-            model = AutoModelForCausalLM.from_pretrained(
-                self.config.grpo_model_name,
-                torch_dtype=torch.bfloat16 if self.config.grpo_use_bf16 else torch.float16 if self.config.grpo_use_fp16 else torch.float32,
-            )
-            model = model.to(self.device)
-            print(f"Policy model loaded on {torch.cuda.device_count()} GPUs")
-        else:
-            # 单GPU训练，显式指定GPU设备
-            model = AutoModelForCausalLM.from_pretrained(
-                self.config.grpo_model_name,
-                torch_dtype=torch.bfloat16 if self.config.grpo_use_bf16 else torch.float16 if self.config.grpo_use_fp16 else torch.float32,
-            )
-            model = model.to(self.device)
-            print(f"Policy model loaded on GPU: {self.device}")
-        
-        return model
-    
-    def _load_reference_model(self):
-        """加载参考模型"""
-        if self.config.grpo_use_multi_gpu and torch.cuda.device_count() > 1:
-            # 多GPU训练
-            model = AutoModelForCausalLM.from_pretrained(
-                self.config.grpo_model_name,
-                torch_dtype=torch.bfloat16 if self.config.grpo_use_bf16 else torch.float16 if self.config.grpo_use_fp16 else torch.float32,
-            )
-            model = model.to(self.device)
-            print(f"Reference model loaded on {torch.cuda.device_count()} GPUs")
-        else:
-            # 单GPU训练，显式指定GPU设备
-            model = AutoModelForCausalLM.from_pretrained(
-                self.config.grpo_model_name,
-                torch_dtype=torch.bfloat16 if self.config.grpo_use_bf16 else torch.float16 if self.config.grpo_use_fp16 else torch.float32,
-            )
-            model = model.to(self.device)
-            print(f"Reference model loaded on GPU: {self.device}")
-        
-        for param in model.parameters():
-            param.requires_grad = False
-        model.eval()
-        
-        return model
-    
-    def _setup_distributed_training(self):
-        """设置分布式训练"""
-        self.is_distributed = False
-        self.local_rank = -1
-        
-        if self.config.grpo_use_multi_gpu and torch.cuda.device_count() > 1:
-            # 初始化分布式训练
-            if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-                self.local_rank = int(os.environ['RANK'])
-                self.world_size = int(os.environ['WORLD_SIZE'])
-            else:
-                self.local_rank = 0
-                self.world_size = torch.cuda.device_count()
-                os.environ['MASTER_ADDR'] = 'localhost'
-                os.environ['MASTER_PORT'] = '12356'
-                os.environ['RANK'] = str(self.local_rank)
-                os.environ['WORLD_SIZE'] = str(self.world_size)
-            
-            if not dist.is_initialized():
-                dist.init_process_group(backend='nccl', init_method='env://')
-            
-            self.local_rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
-            torch.cuda.set_device(self.local_rank)
-            
+        if self.is_distributed:
             # 包装策略模型为DDP
             self.model = DDP(
                 self.model,
@@ -172,36 +103,9 @@ class GRPOTrainer:
                 output_device=self.local_rank,
                 find_unused_parameters=self.config.grpo_ddp_find_unused_parameters
             )
-            
-            self.is_distributed = True
             print(f"GRPO distributed training initialized: rank {self.local_rank}/{self.world_size}")
-        elif len(self.config.grpo_gpu_ids) == 1:
-            print("Single GPU training")
-        else:
-            print("CPU training")
     
-    def load_data(self, data_path: str) -> List[Dict[str, Any]]:
-        """加载训练数据"""
-        data = []
-        if data_path.endswith('.jsonl'):
-            # 加载JSONL格式文件
-            with open(data_path, 'r', encoding='utf-8') as f:
-                for line in f:
-                    item = json.loads(line)
-                    # 适配GSM8K格式
-                    if 'question' in item and 'answer' in item:
-                        data.append(item)
-                    elif 'problem' in item and 'solution' in item:
-                        # 适配MATH格式
-                        data.append({
-                            'question': item['problem'],
-                            'answer': item['solution']
-                        })
-        elif data_path.endswith('.json'):
-            # 加载JSON格式文件
-            with open(data_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        return data
+
     
     def tokenize_batch(self, batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -495,47 +399,29 @@ class GRPOTrainer:
         
         return total_loss, metrics
     
-    def create_data_loader(self, data: List[Dict[str, Any]], batch_size: int, shuffle: bool = True):
-        """创建数据加载器"""
-        class MathDataset(Dataset):
-            def __init__(self, data):
-                self.data = data
-            def __len__(self):
-                return len(self.data)
-            def __getitem__(self, idx):
-                return self.data[idx]
-        
-        dataset = MathDataset(data)
-        
-        # 在分布式训练中使用DistributedSampler
-        if self.is_distributed:
-            from torch.utils.data.distributed import DistributedSampler
-            sampler = DistributedSampler(dataset, shuffle=shuffle)
-            return DataLoader(
-                dataset,
-                batch_size=batch_size,
-                sampler=sampler,
-                collate_fn=self.tokenize_batch,
-                num_workers=0
-            )
-        else:
-            return DataLoader(
-                dataset,
-                batch_size=batch_size,
-                shuffle=shuffle,
-                collate_fn=self.tokenize_batch,
-                num_workers=0
-            )
+
     
     def train(self):
         """执行GRPO训练"""
         # 加载数据
-        train_data = self.load_data(self.config.grpo_train_data_path)
-        val_data = self.load_data(self.config.grpo_val_data_path)
+        train_data = load_data(self.config.grpo_train_data_path)
+        val_data = load_data(self.config.grpo_val_data_path)
         
         # 创建数据加载器
-        train_loader = self.create_data_loader(train_data, self.config.grpo_batch_size, shuffle=True)
-        val_loader = self.create_data_loader(val_data, self.config.grpo_batch_size, shuffle=False)
+        train_loader = create_data_loader(
+            train_data, 
+            self.config.grpo_batch_size, 
+            shuffle=True, 
+            is_distributed=self.is_distributed, 
+            collate_fn=self.tokenize_batch
+        )
+        val_loader = create_data_loader(
+            val_data, 
+            self.config.grpo_batch_size, 
+            shuffle=False, 
+            is_distributed=self.is_distributed, 
+            collate_fn=self.tokenize_batch
+        )
         
         # 配置训练参数
         optimizer = torch.optim.AdamW(
@@ -600,7 +486,7 @@ class GRPOTrainer:
                 if global_step % self.config.grpo_save_steps == 0 and (not self.is_distributed or self.local_rank == 0):
                     save_path = os.path.join(self.output_dir, f"checkpoint_{global_step}")
                     # 获取底层模型（处理DDP包装的情况）
-                    model_to_save = self.model.module if self.is_distributed else self.model
+                    model_to_save = get_model_to_save(self.model, self.is_distributed)
                     model_to_save.save_pretrained(save_path)
                     self.tokenizer.save_pretrained(save_path)
                     self._log(f"Model saved to {save_path}")
@@ -617,7 +503,7 @@ class GRPOTrainer:
                         best_val_loss = val_loss
                         best_save_path = os.path.join(self.output_dir, "best_model")
                         # 获取底层模型（处理DDP包装的情况）
-                        model_to_save = self.model.module if self.is_distributed else self.model
+                        model_to_save = get_model_to_save(self.model, self.is_distributed)
                         model_to_save.save_pretrained(best_save_path)
                         self.tokenizer.save_pretrained(best_save_path)
                         self._log(f"Best model saved to {best_save_path}")
@@ -626,7 +512,7 @@ class GRPOTrainer:
         if not self.is_distributed or self.local_rank == 0:
             final_save_path = os.path.join(self.output_dir, "final_model")
             # 获取底层模型（处理DDP包装的情况）
-            model_to_save = self.model.module if self.is_distributed else self.model
+            model_to_save = get_model_to_save(self.model, self.is_distributed)
             model_to_save.save_pretrained(final_save_path)
             self.tokenizer.save_pretrained(final_save_path)
             self._log(f"Final model saved to {final_save_path}")
@@ -705,6 +591,4 @@ class GRPOTrainer:
     
     def _log(self, message):
         """记录日志到文件和控制台"""
-        print(message)
-        with open(self.log_file, 'a', encoding='utf-8') as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+        log_message(message, self.log_file)

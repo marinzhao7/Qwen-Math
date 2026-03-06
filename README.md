@@ -149,34 +149,6 @@ torchrun --nproc_per_node=2 scripts/run_grpo.py
 | `sft_gpu_ids` / `grpo_gpu_ids` | 指定使用的GPU ID列表 | `None`（使用所有可用GPU） |
 | `sft_ddp_find_unused_parameters` / `grpo_ddp_find_unused_parameters` | DDP是否查找未使用参数 | `False` |
 
-## GRPO训练器选择
-
-项目支持两种GRPO训练器实现：
-
-### 1. 自定义GRPO实现（默认）
-```bash
-# 使用自定义GRPO训练器
-python scripts/run_grpo.py
-```
-
-### 2. ms-swift GRPO实现
-```bash
-# 使用ms-swift的GRPO训练器
-python scripts/run_grpo.py --use-swift
-
-# 指定模型路径
-python scripts/run_grpo.py --use-swift --model-path output/sft/final_model
-```
-
-### 两种实现的区别
-
-| 特性 | 自定义实现 | ms-swift实现 |
-|------|-----------|-------------|
-| 依赖 | 仅PyTorch | ms-swift框架 |
-| 灵活性 | 高，易于修改 | 中等，遵循框架规范 |
-| 功能完整性 | 基础GRPO | 完整的RLHF功能 |
-| 推荐场景 | 研究/调试 | 生产环境 |
-
 ## 注意事项
 
 1. 训练过程需要大量计算资源，推荐使用 GPU 进行训练
@@ -189,7 +161,6 @@ python scripts/run_grpo.py --use-swift --model-path output/sft/final_model
 
 - 使用 LoRA 技术减少内存占用
 - 采用 GRPO 算法进行强化学习
-- 支持自定义和ms-swift两种GRPO实现
 - 支持多数据集评估
 - 模块化设计，易于扩展
 

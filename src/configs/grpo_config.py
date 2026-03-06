@@ -24,7 +24,7 @@ class GRPOConfig(BaseConfig):
     grpo_clip_epsilon = 0.2  # PPO-style clipping
     
     # 生成参数
-    grpo_num_generations = 4  # G in GRPO：每组生成样本数
+    grpo_num_generations = 3  # G in GRPO：每组生成样本数
     grpo_max_prompt_length = 512
     grpo_max_new_tokens = 512
     grpo_temperature = 1.0
@@ -50,6 +50,6 @@ class GRPOConfig(BaseConfig):
     grpo_use_bf16 = True
     
     # 多GPU训练配置
-    grpo_use_multi_gpu = True  # 是否使用多GPU训练
-    grpo_gpu_ids = [0, 1]  # None表示使用所有可用GPU，或指定列表如[0, 1]
+    grpo_use_multi_gpu = False  # 是否使用多GPU训练
+    grpo_gpu_ids = [1,]  # None表示使用所有可用GPU，或指定列表如[0, 1]
     grpo_ddp_find_unused_parameters = False  # DDP是否查找未使用参数
