@@ -1,6 +1,7 @@
 import sys
 import os
 import time
+import subprocess
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,7 +16,8 @@ def run_script(script_name: str, description: str):
     start_time = time.time()
     
     try:
-        exec(open(script_path).read())
+        print(f"Executing script: {script_path}")
+        subprocess.run(['python', script_path], check=True)
         elapsed_time = time.time() - start_time
         print(f"\n{description} completed in {elapsed_time:.2f} seconds")
     except Exception as e:

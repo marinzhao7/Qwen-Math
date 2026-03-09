@@ -38,7 +38,7 @@ def test_model_loading():
         from transformers import AutoTokenizer, AutoModelForCausalLM
         
         # 测试加载基础模型
-        model_name = "Qwen/Qwen-3B-Thinking"
+        model_name = "Qwen/Qwen3-1.7B-Base"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype='auto')
         
